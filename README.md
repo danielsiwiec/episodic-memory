@@ -157,6 +157,98 @@ These settings only affect episodic-memory's summarization calls, not your inter
 | Search | No (local SQLite) |
 | MCP tools | No |
 
+## Database Configuration
+
+By default, episodic-memory uses SQLite with sqlite-vec for local vector storage. For production deployments or when you need a shared database, you can use PostgreSQL with pgvector.
+
+### SQLite (Default)
+
+No configuration required. The database is stored at:
+```
+~/.config/superpowers/conversation-index/db.sqlite
+```
+
+### PostgreSQL with pgvector
+
+To use PostgreSQL with pgvector for vector similarity search:
+
+#### Prerequisites
+
+1. PostgreSQL 14+ with pgvector extension installed
+2. Create a database for episodic-memory
+
+```sql
+-- Install pgvector extension (requires superuser)
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+#### Configuration
+
+Set environment variables to enable PostgreSQL:
+
+```bash
+# Required: Set provider to postgresql
+export EPISODIC_MEMORY_DB_PROVIDER=postgresql
+
+# Required: PostgreSQL connection URL
+export EPISODIC_MEMORY_POSTGRES_URL=postgresql://user:password@localhost:5432/episodic_memory
+
+# Optional: Connection pool size (default: 10)
+export EPISODIC_MEMORY_POSTGRES_POOL_SIZE=10
+
+# Optional: Enable SSL (default: false)
+export EPISODIC_MEMORY_POSTGRES_SSL=true
+```
+
+Alternatively, create a config file at `~/.config/superpowers/conversation-index/config.json`:
+
+```json
+{
+  "database": {
+    "provider": "postgresql",
+    "postgresql": {
+      "url": "postgresql://user:password@localhost:5432/episodic_memory",
+      "poolSize": 10,
+      "ssl": false
+    }
+  }
+}
+```
+
+**Configuration precedence:** Environment variables > config file > defaults (SQLite)
+
+### Migrating from SQLite to PostgreSQL
+
+If you have existing data in SQLite and want to migrate to PostgreSQL:
+
+```bash
+# Dry run - see what would be migrated
+episodic-memory migrate --dry-run
+
+# Perform the migration
+episodic-memory migrate
+
+# Verify the migration
+episodic-memory migrate --verify
+```
+
+The migration preserves:
+- All conversation exchanges with metadata
+- Vector embeddings (converted to pgvector format)
+- Tool call history
+- Timestamps and indexing information
+
+### Comparison
+
+| Feature | SQLite + sqlite-vec | PostgreSQL + pgvector |
+|---------|--------------------|-----------------------|
+| Setup | Zero configuration | Requires PostgreSQL server |
+| Storage | Local file | Network database |
+| Sharing | Single machine | Multiple clients |
+| Vector index | IVF | HNSW (faster queries) |
+| Scalability | Good for personal use | Production-ready |
+| Backup | File copy | pg_dump or replication |
+
 ## Commands
 
 ### `episodic-memory sync`
@@ -227,7 +319,7 @@ open output.html
 1. **Sync** - Copies conversation files from `~/.claude/projects` to archive
 2. **Parse** - Extracts user-agent exchanges from JSONL format
 3. **Embed** - Generates vector embeddings using Transformers.js (local, offline)
-4. **Index** - Stores in SQLite with sqlite-vec for fast similarity search
+4. **Index** - Stores in SQLite with sqlite-vec (default) or PostgreSQL with pgvector
 5. **Search** - Semantic search using vector similarity or exact text matching
 
 ## Excluding Conversations

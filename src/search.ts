@@ -1,7 +1,7 @@
-import Database from 'better-sqlite3';
-import { initDatabase } from './db.js';
+import { getProvider, closeProvider } from './db.js';
 import { initEmbeddings, generateEmbedding } from './embeddings.js';
 import { SearchResult, ConversationExchange, MultiConceptResult } from './types.js';
+import { rowToExchange, RawSearchResult } from './db-provider.js';
 import fs from 'fs';
 import readline from 'readline';
 
@@ -34,73 +34,27 @@ export async function searchConversations(
   if (after) validateISODate(after, '--after');
   if (before) validateISODate(before, '--before');
 
-  const db = initDatabase();
+  const provider = await getProvider();
 
-  let results: any[] = [];
-
-  // Build time filter clause
-  const timeFilter = [];
-  if (after) timeFilter.push(`e.timestamp >= '${after}'`);
-  if (before) timeFilter.push(`e.timestamp <= '${before}'`);
-  const timeClause = timeFilter.length > 0 ? `AND ${timeFilter.join(' AND ')}` : '';
+  let results: RawSearchResult[] = [];
 
   if (mode === 'vector' || mode === 'both') {
     // Vector similarity search
     await initEmbeddings();
     const queryEmbedding = await generateEmbedding(query);
 
-    const stmt = db.prepare(`
-      SELECT
-        e.id,
-        e.project,
-        e.timestamp,
-        e.user_message,
-        e.assistant_message,
-        e.archive_path,
-        e.line_start,
-        e.line_end,
-        vec.distance
-      FROM vec_exchanges AS vec
-      JOIN exchanges AS e ON vec.id = e.id
-      WHERE vec.embedding MATCH ?
-        AND k = ?
-        ${timeClause}
-      ORDER BY vec.distance ASC
-    `);
-
-    results = stmt.all(
-      Buffer.from(new Float32Array(queryEmbedding).buffer),
-      limit
-    );
+    results = await provider.searchByVector(queryEmbedding, { limit, after, before });
   }
 
   if (mode === 'text' || mode === 'both') {
     // Text search
-    const textStmt = db.prepare(`
-      SELECT
-        e.id,
-        e.project,
-        e.timestamp,
-        e.user_message,
-        e.assistant_message,
-        e.archive_path,
-        e.line_start,
-        e.line_end,
-        0 as distance
-      FROM exchanges AS e
-      WHERE (e.user_message LIKE ? OR e.assistant_message LIKE ?)
-        ${timeClause}
-      ORDER BY e.timestamp DESC
-      LIMIT ?
-    `);
-
-    const textResults = textStmt.all(`%${query}%`, `%${query}%`, limit);
+    const textResults = await provider.searchByText(query, { limit, after, before });
 
     if (mode === 'both') {
       // Merge and deduplicate by ID
       const seenIds = new Set(results.map(r => r.id));
       for (const textResult of textResults) {
-        if (!seenIds.has((textResult as any).id)) {
+        if (!seenIds.has(textResult.id)) {
           results.push(textResult);
         }
       }
@@ -109,19 +63,11 @@ export async function searchConversations(
     }
   }
 
-  db.close();
+  // Note: We don't close the provider here to allow for multiple searches
+  // The provider will be reused for subsequent searches
 
-  return results.map((row: any) => {
-    const exchange: ConversationExchange = {
-      id: row.id,
-      project: row.project,
-      timestamp: row.timestamp,
-      userMessage: row.user_message,
-      assistantMessage: row.assistant_message,
-      archivePath: row.archive_path,
-      lineStart: row.line_start,
-      lineEnd: row.line_end
-    };
+  return results.map((row: RawSearchResult) => {
+    const exchange = rowToExchange(row);
 
     // Try to load summary if available
     const summaryPath = row.archive_path.replace('.jsonl', '-summary.txt');
@@ -337,4 +283,3 @@ export async function formatMultiConceptResults(
 
   return output;
 }
-

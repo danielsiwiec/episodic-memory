@@ -3,11 +3,11 @@
   "version": "1.0.15",
   "description": "Semantic search for Claude Code conversations. Remember past discussions, decisions, and patterns.",
   "author": {
-    "name": "Jesse Vincent",
-    "email": "jesse@fsck.com"
+    "name": "Dan Siwiec",
+    "email": "daniel.siwiec@gmail.com"
   },
-  "homepage": "https://github.com/obra/episodic-memory",
-  "repository": "https://github.com/obra/episodic-memory",
+  "homepage": "https://github.com/danielsiwiec/episodic-memory",
+  "repository": "https://github.com/danielsiwiec/episodic-memory",
   "license": "MIT",
   "keywords": ["memory", "search", "conversations", "semantic-search", "episodic"],
   "agents": ["./agents/search-conversations.md"],
