@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { initDatabase, insertExchange } from './db.js';
+import { getProvider, closeProvider } from './db.js';
 import { parseConversation } from './parser.js';
 import { initEmbeddings, generateExchangeEmbedding } from './embeddings.js';
 import { summarizeConversation } from './summarizer.js';
@@ -37,14 +37,23 @@ async function processBatch<T, R>(
   return results;
 }
 
+// Helper to check if a file is within the days limit based on mtime
+function isWithinDaysLimit(filePath: string, days: number | undefined): boolean {
+  if (days === undefined) return true;
+  const stat = fs.statSync(filePath);
+  const cutoffTime = Date.now() - (days * 24 * 60 * 60 * 1000);
+  return stat.mtimeMs >= cutoffTime;
+}
+
 export async function indexConversations(
   limitToProject?: string,
   maxConversations?: number,
   concurrency: number = 1,
-  noSummaries: boolean = false
+  noSummaries: boolean = false,
+  days?: number
 ): Promise<void> {
   console.log('Initializing database...');
-  const db = initDatabase();
+  const provider = await getProvider();
 
   console.log('Loading embedding model...');
   await initEmbeddings();
@@ -52,10 +61,13 @@ export async function indexConversations(
   if (noSummaries) {
     console.log('⚠️  Running in no-summaries mode (skipping AI summaries)');
   }
+  if (days !== undefined) {
+    console.log(`📅 Filtering to conversations from the last ${days} day(s)`);
+  }
 
   console.log('Scanning for conversation files...');
   const PROJECTS_DIR = getProjectsDir();
-  const ARCHIVE_DIR = getArchiveDir(); // Now uses paths.ts
+  const ARCHIVE_DIR = getArchiveDir();
   const projects = fs.readdirSync(PROJECTS_DIR);
 
   let totalExchanges = 0;
@@ -102,6 +114,11 @@ export async function indexConversations(
     for (const file of files) {
       const sourcePath = path.join(projectPath, file);
       const archivePath = path.join(projectArchive, file);
+
+      // Filter by days if specified
+      if (!isWithinDaysLimit(sourcePath, days)) {
+        continue;
+      }
 
       // Copy to archive
       if (!fs.existsSync(archivePath)) {
@@ -160,7 +177,7 @@ export async function indexConversations(
           toolNames
         );
 
-        insertExchange(db, exchange, embedding, toolNames);
+        await provider.insertExchange(exchange, embedding, toolNames);
       }
 
       totalExchanges += conv.exchanges.length;
@@ -169,14 +186,14 @@ export async function indexConversations(
       // Check if we hit the limit
       if (maxConversations && conversationsProcessed >= maxConversations) {
         console.log(`\nReached limit of ${maxConversations} conversations`);
-        db.close();
+        await closeProvider();
         console.log(`✅ Indexing complete! Conversations: ${conversationsProcessed}, Exchanges: ${totalExchanges}`);
         return;
       }
     }
   }
 
-  db.close();
+  await closeProvider();
   console.log(`\n✅ Indexing complete! Conversations: ${conversationsProcessed}, Exchanges: ${totalExchanges}`);
 }
 
@@ -185,7 +202,7 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
 
   // Find the conversation file for this session
   const PROJECTS_DIR = getProjectsDir();
-  const ARCHIVE_DIR = getArchiveDir(); // Now uses paths.ts
+  const ARCHIVE_DIR = getArchiveDir();
   const projects = fs.readdirSync(PROJECTS_DIR);
   const excludedProjects = getExcludedProjects();
   let found = false;
@@ -203,7 +220,7 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
       const file = files[0];
       const sourcePath = path.join(projectPath, file);
 
-      const db = initDatabase();
+      const provider = await getProvider();
       await initEmbeddings();
 
       const projectArchive = path.join(ARCHIVE_DIR, project);
@@ -236,13 +253,13 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
             exchange.assistantMessage,
             toolNames
           );
-          insertExchange(db, exchange, embedding, toolNames);
+          await provider.insertExchange(exchange, embedding, toolNames);
         }
 
         console.log(`✅ Indexed session ${sessionId}: ${exchanges.length} exchanges`);
       }
 
-      db.close();
+      await closeProvider();
       break;
     }
   }
@@ -252,16 +269,17 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
   }
 }
 
-export async function indexUnprocessed(concurrency: number = 1, noSummaries: boolean = false): Promise<void> {
+export async function indexUnprocessed(concurrency: number = 1, noSummaries: boolean = false, days?: number): Promise<void> {
   console.log('Finding unprocessed conversations...');
   if (concurrency > 1) console.log(`Concurrency: ${concurrency}`);
   if (noSummaries) console.log('⚠️  Running in no-summaries mode (skipping AI summaries)');
+  if (days !== undefined) console.log(`📅 Filtering to conversations from the last ${days} day(s)`);
 
-  const db = initDatabase();
+  const provider = await getProvider();
   await initEmbeddings();
 
   const PROJECTS_DIR = getProjectsDir();
-  const ARCHIVE_DIR = getArchiveDir(); // Now uses paths.ts
+  const ARCHIVE_DIR = getArchiveDir();
   const projects = fs.readdirSync(PROJECTS_DIR);
   const excludedProjects = getExcludedProjects();
 
@@ -291,11 +309,15 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
       const archivePath = path.join(projectArchive, file);
       const summaryPath = archivePath.replace('.jsonl', '-summary.txt');
 
-      // Check if already indexed in database
-      const alreadyIndexed = db.prepare('SELECT COUNT(*) as count FROM exchanges WHERE archive_path = ?')
-        .get(archivePath) as { count: number };
+      // Filter by days if specified
+      if (!isWithinDaysLimit(sourcePath, days)) {
+        continue;
+      }
 
-      if (alreadyIndexed.count > 0) continue;
+      // Check if already indexed in database
+      const alreadyIndexed = await provider.hasExchangesForArchive(archivePath);
+
+      if (alreadyIndexed) continue;
 
       fs.mkdirSync(projectArchive, { recursive: true });
 
@@ -314,7 +336,7 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
 
   if (unprocessed.length === 0) {
     console.log('✅ All conversations are already processed!');
-    db.close();
+    await closeProvider();
     return;
   }
 
@@ -353,10 +375,10 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
         exchange.assistantMessage,
         toolNames
       );
-      insertExchange(db, exchange, embedding, toolNames);
+      await provider.insertExchange(exchange, embedding, toolNames);
     }
   }
 
-  db.close();
+  await closeProvider();
   console.log(`\n✅ Processed ${unprocessed.length} conversations`);
 }

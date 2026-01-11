@@ -23,8 +23,19 @@ function getNoSummaries(): boolean {
   return process.argv.includes('--no-summaries');
 }
 
+// Parse -d or --days flag for filtering by age
+function getDays(): number | undefined {
+  const daysIndex = process.argv.findIndex(arg => arg === '-d' || arg === '--days');
+  if (daysIndex !== -1 && process.argv[daysIndex + 1]) {
+    const value = parseInt(process.argv[daysIndex + 1], 10);
+    if (value >= 1) return value;
+  }
+  return undefined;
+}
+
 const concurrency = getConcurrency();
 const noSummaries = getNoSummaries();
+const days = getDays();
 
 async function main() {
   try {
@@ -39,7 +50,7 @@ async function main() {
         break;
 
       case 'index-cleanup':
-        await indexUnprocessed(concurrency, noSummaries);
+        await indexUnprocessed(concurrency, noSummaries, days);
         break;
 
       case 'verify':
@@ -104,12 +115,12 @@ async function main() {
 
         // Re-index everything
         console.log('Re-indexing all conversations...');
-        await indexConversations(undefined, undefined, concurrency, noSummaries);
+        await indexConversations(undefined, undefined, concurrency, noSummaries, days);
         break;
 
       case 'index-all':
       default:
-        await indexConversations(undefined, undefined, concurrency, noSummaries);
+        await indexConversations(undefined, undefined, concurrency, noSummaries, days);
         break;
     }
   } catch (error) {
