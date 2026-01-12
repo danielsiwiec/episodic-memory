@@ -1,12 +1,22 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { initDatabase, insertExchange } from './db.js';
+import { getProvider, closeProvider } from './db.js';
 import { parseConversation } from './parser.js';
 import { initEmbeddings, generateExchangeEmbedding } from './embeddings.js';
 import { summarizeConversation } from './summarizer.js';
 import { ConversationExchange } from './types.js';
 import { getArchiveDir, getExcludedProjects } from './paths.js';
+import { isPostgresql } from './config.js';
+
+// Helper to extract session ID from file path
+function extractSessionIdFromPath(filePath: string): string | null {
+  const basename = path.basename(filePath, '.jsonl');
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(basename)) {
+    return basename;
+  }
+  return null;
+}
 
 // Set max output tokens for Claude SDK (used by summarizer)
 process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = '20000';
@@ -37,14 +47,23 @@ async function processBatch<T, R>(
   return results;
 }
 
+// Helper to check if a file is within the days limit based on mtime
+function isWithinDaysLimit(filePath: string, days: number | undefined): boolean {
+  if (days === undefined) return true;
+  const stat = fs.statSync(filePath);
+  const cutoffTime = Date.now() - (days * 24 * 60 * 60 * 1000);
+  return stat.mtimeMs >= cutoffTime;
+}
+
 export async function indexConversations(
   limitToProject?: string,
   maxConversations?: number,
   concurrency: number = 1,
-  noSummaries: boolean = false
+  noSummaries: boolean = false,
+  days?: number
 ): Promise<void> {
   console.log('Initializing database...');
-  const db = initDatabase();
+  const provider = await getProvider();
 
   console.log('Loading embedding model...');
   await initEmbeddings();
@@ -52,10 +71,16 @@ export async function indexConversations(
   if (noSummaries) {
     console.log('⚠️  Running in no-summaries mode (skipping AI summaries)');
   }
+  if (days !== undefined) {
+    console.log(`📅 Filtering to conversations from the last ${days} day(s)`);
+  }
+  if (maxConversations !== undefined) {
+    console.log(`🔢 Limiting to ${maxConversations} conversation(s)`);
+  }
 
   console.log('Scanning for conversation files...');
   const PROJECTS_DIR = getProjectsDir();
-  const ARCHIVE_DIR = getArchiveDir(); // Now uses paths.ts
+  const ARCHIVE_DIR = getArchiveDir();
   const projects = fs.readdirSync(PROJECTS_DIR);
 
   let totalExchanges = 0;
@@ -103,6 +128,11 @@ export async function indexConversations(
       const sourcePath = path.join(projectPath, file);
       const archivePath = path.join(projectArchive, file);
 
+      // Filter by days if specified
+      if (!isWithinDaysLimit(sourcePath, days)) {
+        continue;
+      }
+
       // Copy to archive
       if (!fs.existsSync(archivePath)) {
         fs.copyFileSync(sourcePath, archivePath);
@@ -124,11 +154,39 @@ export async function indexConversations(
         summaryPath: archivePath.replace('.jsonl', '-summary.txt'),
         exchanges
       });
+
+      // Check if we've collected enough conversations for this batch
+      if (maxConversations && (conversationsProcessed + toProcess.length) >= maxConversations) {
+        // Trim to exact limit needed
+        const remaining = maxConversations - conversationsProcessed;
+        if (toProcess.length > remaining) {
+          toProcess.length = remaining;
+        }
+        break;
+      }
     }
 
     // Batch summarize conversations in parallel (unless --no-summaries)
     if (!noSummaries) {
-      const needsSummary = toProcess.filter(c => !fs.existsSync(c.summaryPath));
+      // Filter conversations that need summaries
+      const usePostgres = isPostgresql();
+      const needsSummary: typeof toProcess = [];
+
+      for (const conv of toProcess) {
+        const sessionId = extractSessionIdFromPath(conv.sourcePath);
+        if (usePostgres && sessionId && provider.hasSummary) {
+          // Check DB for existing summary
+          const hasSummary = await provider.hasSummary(sessionId);
+          if (!hasSummary) {
+            needsSummary.push(conv);
+          }
+        } else {
+          // Check local file for existing summary
+          if (!fs.existsSync(conv.summaryPath)) {
+            needsSummary.push(conv);
+          }
+        }
+      }
 
       if (needsSummary.length > 0) {
         console.log(`  Generating ${needsSummary.length} summaries (concurrency: ${concurrency})...`);
@@ -136,7 +194,17 @@ export async function indexConversations(
         await processBatch(needsSummary, async (conv) => {
           try {
             const summary = await summarizeConversation(conv.exchanges);
-            fs.writeFileSync(conv.summaryPath, summary, 'utf-8');
+
+            // Write to DB if PostgreSQL, otherwise write to file
+            if (usePostgres && provider.setSummary) {
+              const sessionId = extractSessionIdFromPath(conv.sourcePath);
+              if (sessionId) {
+                await provider.setSummary(sessionId, project, summary);
+              }
+            } else {
+              fs.writeFileSync(conv.summaryPath, summary, 'utf-8');
+            }
+
             const wordCount = summary.split(/\s+/).length;
             console.log(`  ✓ ${conv.file}: ${wordCount} words`);
             return summary;
@@ -160,7 +228,7 @@ export async function indexConversations(
           toolNames
         );
 
-        insertExchange(db, exchange, embedding, toolNames);
+        await provider.insertExchange(exchange, embedding, toolNames);
       }
 
       totalExchanges += conv.exchanges.length;
@@ -169,14 +237,14 @@ export async function indexConversations(
       // Check if we hit the limit
       if (maxConversations && conversationsProcessed >= maxConversations) {
         console.log(`\nReached limit of ${maxConversations} conversations`);
-        db.close();
+        await closeProvider();
         console.log(`✅ Indexing complete! Conversations: ${conversationsProcessed}, Exchanges: ${totalExchanges}`);
         return;
       }
     }
   }
 
-  db.close();
+  await closeProvider();
   console.log(`\n✅ Indexing complete! Conversations: ${conversationsProcessed}, Exchanges: ${totalExchanges}`);
 }
 
@@ -185,7 +253,7 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
 
   // Find the conversation file for this session
   const PROJECTS_DIR = getProjectsDir();
-  const ARCHIVE_DIR = getArchiveDir(); // Now uses paths.ts
+  const ARCHIVE_DIR = getArchiveDir();
   const projects = fs.readdirSync(PROJECTS_DIR);
   const excludedProjects = getExcludedProjects();
   let found = false;
@@ -203,7 +271,7 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
       const file = files[0];
       const sourcePath = path.join(projectPath, file);
 
-      const db = initDatabase();
+      const provider = await getProvider();
       await initEmbeddings();
 
       const projectArchive = path.join(ARCHIVE_DIR, project);
@@ -222,9 +290,28 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
       if (exchanges.length > 0) {
         // Generate summary (unless --no-summaries)
         const summaryPath = archivePath.replace('.jsonl', '-summary.txt');
-        if (!noSummaries && !fs.existsSync(summaryPath)) {
+        const usePostgres = isPostgresql();
+
+        // Check if summary exists
+        let needsSummary = false;
+        if (!noSummaries) {
+          if (usePostgres && provider.hasSummary) {
+            needsSummary = !(await provider.hasSummary(sessionId));
+          } else {
+            needsSummary = !fs.existsSync(summaryPath);
+          }
+        }
+
+        if (needsSummary) {
           const summary = await summarizeConversation(exchanges);
-          fs.writeFileSync(summaryPath, summary, 'utf-8');
+
+          // Write to DB if PostgreSQL, otherwise write to file
+          if (usePostgres && provider.setSummary) {
+            await provider.setSummary(sessionId, project, summary);
+          } else {
+            fs.writeFileSync(summaryPath, summary, 'utf-8');
+          }
+
           console.log(`Summary: ${summary.split(/\s+/).length} words`);
         }
 
@@ -236,13 +323,13 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
             exchange.assistantMessage,
             toolNames
           );
-          insertExchange(db, exchange, embedding, toolNames);
+          await provider.insertExchange(exchange, embedding, toolNames);
         }
 
         console.log(`✅ Indexed session ${sessionId}: ${exchanges.length} exchanges`);
       }
 
-      db.close();
+      await closeProvider();
       break;
     }
   }
@@ -252,16 +339,17 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
   }
 }
 
-export async function indexUnprocessed(concurrency: number = 1, noSummaries: boolean = false): Promise<void> {
+export async function indexUnprocessed(concurrency: number = 1, noSummaries: boolean = false, days?: number): Promise<void> {
   console.log('Finding unprocessed conversations...');
   if (concurrency > 1) console.log(`Concurrency: ${concurrency}`);
   if (noSummaries) console.log('⚠️  Running in no-summaries mode (skipping AI summaries)');
+  if (days !== undefined) console.log(`📅 Filtering to conversations from the last ${days} day(s)`);
 
-  const db = initDatabase();
+  const provider = await getProvider();
   await initEmbeddings();
 
   const PROJECTS_DIR = getProjectsDir();
-  const ARCHIVE_DIR = getArchiveDir(); // Now uses paths.ts
+  const ARCHIVE_DIR = getArchiveDir();
   const projects = fs.readdirSync(PROJECTS_DIR);
   const excludedProjects = getExcludedProjects();
 
@@ -291,11 +379,15 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
       const archivePath = path.join(projectArchive, file);
       const summaryPath = archivePath.replace('.jsonl', '-summary.txt');
 
-      // Check if already indexed in database
-      const alreadyIndexed = db.prepare('SELECT COUNT(*) as count FROM exchanges WHERE archive_path = ?')
-        .get(archivePath) as { count: number };
+      // Filter by days if specified
+      if (!isWithinDaysLimit(sourcePath, days)) {
+        continue;
+      }
 
-      if (alreadyIndexed.count > 0) continue;
+      // Check if already indexed in database
+      const alreadyIndexed = await provider.hasExchangesForArchive(archivePath);
+
+      if (alreadyIndexed) continue;
 
       fs.mkdirSync(projectArchive, { recursive: true });
 
@@ -314,7 +406,7 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
 
   if (unprocessed.length === 0) {
     console.log('✅ All conversations are already processed!');
-    db.close();
+    await closeProvider();
     return;
   }
 
@@ -322,14 +414,40 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
 
   // Batch process summaries (unless --no-summaries)
   if (!noSummaries) {
-    const needsSummary = unprocessed.filter(c => !fs.existsSync(c.summaryPath));
+    const usePostgres = isPostgresql();
+    const needsSummary: typeof unprocessed = [];
+
+    for (const conv of unprocessed) {
+      const sessionId = extractSessionIdFromPath(conv.sourcePath);
+      if (usePostgres && sessionId && provider.hasSummary) {
+        const hasSummary = await provider.hasSummary(sessionId);
+        if (!hasSummary) {
+          needsSummary.push(conv);
+        }
+      } else {
+        if (!fs.existsSync(conv.summaryPath)) {
+          needsSummary.push(conv);
+        }
+      }
+    }
+
     if (needsSummary.length > 0) {
       console.log(`Generating ${needsSummary.length} summaries (concurrency: ${concurrency})...\n`);
 
       await processBatch(needsSummary, async (conv) => {
         try {
           const summary = await summarizeConversation(conv.exchanges);
-          fs.writeFileSync(conv.summaryPath, summary, 'utf-8');
+
+          // Write to DB if PostgreSQL, otherwise write to file
+          if (usePostgres && provider.setSummary) {
+            const sessionId = extractSessionIdFromPath(conv.sourcePath);
+            if (sessionId) {
+              await provider.setSummary(sessionId, conv.project, summary);
+            }
+          } else {
+            fs.writeFileSync(conv.summaryPath, summary, 'utf-8');
+          }
+
           const wordCount = summary.split(/\s+/).length;
           console.log(`  ✓ ${conv.project}/${conv.file}: ${wordCount} words`);
           return summary;
@@ -353,10 +471,10 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
         exchange.assistantMessage,
         toolNames
       );
-      insertExchange(db, exchange, embedding, toolNames);
+      await provider.insertExchange(exchange, embedding, toolNames);
     }
   }
 
-  db.close();
+  await closeProvider();
   console.log(`\n✅ Processed ${unprocessed.length} conversations`);
 }

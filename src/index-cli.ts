@@ -23,8 +23,30 @@ function getNoSummaries(): boolean {
   return process.argv.includes('--no-summaries');
 }
 
+// Parse -d or --days flag for filtering by age
+function getDays(): number | undefined {
+  const daysIndex = process.argv.findIndex(arg => arg === '-d' || arg === '--days');
+  if (daysIndex !== -1 && process.argv[daysIndex + 1]) {
+    const value = parseInt(process.argv[daysIndex + 1], 10);
+    if (value >= 1) return value;
+  }
+  return undefined;
+}
+
+// Parse --limit or -l flag for limiting number of conversations
+function getLimit(): number | undefined {
+  const limitIndex = process.argv.findIndex(arg => arg === '-l' || arg === '--limit');
+  if (limitIndex !== -1 && process.argv[limitIndex + 1]) {
+    const value = parseInt(process.argv[limitIndex + 1], 10);
+    if (value >= 1) return value;
+  }
+  return undefined;
+}
+
 const concurrency = getConcurrency();
 const noSummaries = getNoSummaries();
+const days = getDays();
+const limit = getLimit();
 
 async function main() {
   try {
@@ -39,7 +61,7 @@ async function main() {
         break;
 
       case 'index-cleanup':
-        await indexUnprocessed(concurrency, noSummaries);
+        await indexUnprocessed(concurrency, noSummaries, days);
         break;
 
       case 'verify':
@@ -104,12 +126,12 @@ async function main() {
 
         // Re-index everything
         console.log('Re-indexing all conversations...');
-        await indexConversations(undefined, undefined, concurrency, noSummaries);
+        await indexConversations(undefined, undefined, concurrency, noSummaries, days);
         break;
 
       case 'index-all':
       default:
-        await indexConversations(undefined, undefined, concurrency, noSummaries);
+        await indexConversations(undefined, limit, concurrency, noSummaries, days);
         break;
     }
   } catch (error) {
