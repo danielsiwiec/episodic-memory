@@ -42,6 +42,7 @@ COMMANDS:
   search      Search indexed conversations
   show        Display a conversation in readable format
   stats       Show index statistics
+  migrate     Migrate data from SQLite to PostgreSQL
 
 Run 'episodic-memory <command> --help' for command-specific help.
 
@@ -82,6 +83,10 @@ async function main() {
 
       case 'sync':
         await runScript(join(distDir, 'sync-cli.js'), args);
+        break;
+
+      case 'migrate':
+        await runScript(join(distDir, 'migrate-cli.js'), args);
         break;
 
       case '--help':

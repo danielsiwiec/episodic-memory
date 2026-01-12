@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { SUMMARIZER_CONTEXT_MARKER } from './constants.js';
 import { getExcludedProjects } from './paths.js';
+import { isPostgresql } from './config.js';
 
 const EXCLUSION_MARKERS = [
   '<INSTRUCTIONS-TO-EPISODIC-MEMORY>DO NOT INDEX THIS CHAT</INSTRUCTIONS-TO-EPISODIC-MEMORY>',
@@ -66,11 +67,175 @@ function extractSessionIdFromPath(filePath: string): string | null {
   return null;
 }
 
+/**
+ * Sync conversations using PostgreSQL for state tracking (no local archive needed)
+ */
+async function syncConversationsPostgres(
+  sourceDir: string,
+  options: SyncOptions = {}
+): Promise<SyncResult> {
+  const result: SyncResult = {
+    copied: 0,
+    skipped: 0,
+    indexed: 0,
+    summarized: 0,
+    errors: []
+  };
+
+  // Ensure source directory exists
+  if (!fs.existsSync(sourceDir)) {
+    return result;
+  }
+
+  const { getProvider } = await import('./db.js');
+  const provider = await getProvider();
+
+  // Check if provider supports stateless sync
+  if (!provider.needsSync || !provider.setSyncedFile) {
+    throw new Error('Provider does not support stateless sync. Use SQLite mode or syncConversations() instead.');
+  }
+
+  const { initEmbeddings, generateExchangeEmbedding } = await import('./embeddings.js');
+  const { parseConversation } = await import('./parser.js');
+
+  await initEmbeddings();
+
+  // Collect files needing summaries
+  const filesToSummarize: Array<{ path: string; sessionId: string; project: string }> = [];
+
+  // Walk source directory
+  const projects = fs.readdirSync(sourceDir);
+  const excludedProjects = getExcludedProjects();
+
+  for (const project of projects) {
+    if (excludedProjects.includes(project)) {
+      console.log("\nSkipping excluded project: " + project);
+      continue;
+    }
+
+    const projectPath = path.join(sourceDir, project);
+    const stat = fs.statSync(projectPath);
+
+    if (!stat.isDirectory()) continue;
+
+    const files = fs.readdirSync(projectPath).filter(f => f.endsWith('.jsonl'));
+
+    for (const file of files) {
+      const srcFile = path.join(projectPath, file);
+
+      try {
+        const srcStat = fs.statSync(srcFile);
+        const needsSync = await provider.needsSync(srcFile, srcStat.mtimeMs, srcStat.size);
+
+        if (!needsSync) {
+          result.skipped++;
+          continue;
+        }
+
+        // Check for exclusion markers before processing
+        if (shouldSkipConversation(srcFile)) {
+          // Mark as synced but don't index
+          await provider.setSyncedFile(srcFile, srcStat.mtimeMs, srcStat.size);
+          result.skipped++;
+          continue;
+        }
+
+        // Parse and index
+        if (!options.skipIndex) {
+          const exchanges = await parseConversation(srcFile, project, srcFile);
+
+          for (const exchange of exchanges) {
+            const toolNames = exchange.toolCalls?.map(tc => tc.toolName);
+            const embedding = await generateExchangeEmbedding(
+              exchange.userMessage,
+              exchange.assistantMessage,
+              toolNames
+            );
+            await provider.insertExchange(exchange, embedding, toolNames);
+          }
+
+          result.indexed++;
+        }
+
+        // Mark as synced
+        await provider.setSyncedFile(srcFile, srcStat.mtimeMs, srcStat.size);
+        result.copied++;
+
+        // Check if this file needs a summary
+        if (!options.skipSummaries && provider.hasSummary) {
+          const sessionId = extractSessionIdFromPath(srcFile);
+          if (sessionId) {
+            const hasSummary = await provider.hasSummary(sessionId);
+            if (!hasSummary) {
+              filesToSummarize.push({ path: srcFile, sessionId, project });
+            }
+          }
+        }
+      } catch (error) {
+        result.errors.push({
+          file: srcFile,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  }
+
+  // Generate summaries for files that need them
+  if (!options.skipSummaries && filesToSummarize.length > 0 && provider.setSummary) {
+    const { parseConversation: parseConv } = await import('./parser.js');
+    const { summarizeConversation } = await import('./summarizer.js');
+
+    const summaryLimit = options.summaryLimit ?? 10;
+    const toSummarize = filesToSummarize.slice(0, summaryLimit);
+    const remaining = filesToSummarize.length - toSummarize.length;
+
+    console.log(`Generating summaries for ${toSummarize.length} conversation(s)...`);
+    if (remaining > 0) {
+      console.log(`  (${remaining} more need summaries - will process on next sync)`);
+    }
+
+    for (const { path: filePath, sessionId, project } of toSummarize) {
+      try {
+        const exchanges = await parseConv(filePath, project, filePath);
+
+        if (exchanges.length === 0) {
+          continue; // Skip empty conversations
+        }
+
+        console.log(`  Summarizing ${path.basename(filePath)} (${exchanges.length} exchanges)...`);
+        const summary = await summarizeConversation(exchanges);
+
+        await provider.setSummary(sessionId, project, summary);
+        result.summarized++;
+      } catch (error) {
+        result.errors.push({
+          file: filePath,
+          error: `Summary generation failed: ${error instanceof Error ? error.message : String(error)}`
+        });
+      }
+    }
+  }
+
+  await provider.close();
+
+  return result;
+}
+
+/**
+ * Sync conversations from source to destination
+ * When PostgreSQL is configured, uses stateless sync (no local archive needed)
+ * When SQLite is configured, copies files to local archive
+ */
 export async function syncConversations(
   sourceDir: string,
   destDir: string,
   options: SyncOptions = {}
 ): Promise<SyncResult> {
+  // If PostgreSQL is configured, use stateless sync (destDir is ignored)
+  if (isPostgresql()) {
+    return syncConversationsPostgres(sourceDir, options);
+  }
+
   const result: SyncResult = {
     copied: 0,
     skipped: 0,

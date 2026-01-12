@@ -1,5 +1,6 @@
-import Database from 'better-sqlite3';
-import { getDbPath } from './paths.js';
+import { getProvider, closeProvider, resetProvider } from './db.js';
+import { SqliteProvider } from './providers/sqlite-provider.js';
+import fs from 'fs';
 
 export interface IndexStats {
   totalConversations: number;
@@ -13,14 +14,53 @@ export interface IndexStats {
   projectCount: number;
   topProjects?: Array<{ project: string; count: number }>;
   databaseSize?: string;
+  databaseProvider?: string;
 }
 
 export async function getIndexStats(dbPath?: string): Promise<IndexStats> {
-  const resolvedDbPath = dbPath || getDbPath();
+  try {
+    let provider;
+    let shouldClose = true;
 
-  // Check if database exists
-  const fs = await import('fs');
-  if (!fs.existsSync(resolvedDbPath)) {
+    if (dbPath) {
+      // Direct SQLite path provided - create a temporary provider
+      provider = new SqliteProvider({ path: dbPath });
+      await provider.initialize();
+    } else {
+      // Use the configured provider
+      provider = await getProvider();
+      shouldClose = true;
+    }
+
+    const stats = await provider.getStats();
+
+    // Check for summaries (these are files, not DB fields)
+    let withSummariesCount = 0;
+    for (const archivePath of stats.archivePaths) {
+      const summaryPath = archivePath.replace('.jsonl', '-summary.txt');
+      if (fs.existsSync(summaryPath)) {
+        withSummariesCount++;
+      }
+    }
+
+    if (dbPath) {
+      await provider.close();
+    } else {
+      await closeProvider();
+    }
+
+    return {
+      totalConversations: stats.totalConversations,
+      conversationsWithSummaries: withSummariesCount,
+      conversationsWithoutSummaries: stats.totalConversations - withSummariesCount,
+      totalExchanges: stats.totalExchanges,
+      dateRange: stats.dateRange,
+      projectCount: stats.projectCount,
+      topProjects: stats.topProjects,
+      databaseProvider: provider.name,
+    };
+  } catch (error) {
+    // Database might not exist yet
     return {
       totalConversations: 0,
       conversationsWithSummaries: 0,
@@ -29,77 +69,15 @@ export async function getIndexStats(dbPath?: string): Promise<IndexStats> {
       projectCount: 0,
     };
   }
-
-  const db = new Database(resolvedDbPath, { readonly: true });
-
-  try {
-    // Check if tables exist
-    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
-    const hasExchanges = tables.some(t => t.name === 'exchanges');
-
-    if (!hasExchanges) {
-      // Empty database
-      return {
-        totalConversations: 0,
-        conversationsWithSummaries: 0,
-        conversationsWithoutSummaries: 0,
-        totalExchanges: 0,
-        projectCount: 0,
-      };
-    }
-
-    // Total conversations
-    const totalConversations = db.prepare('SELECT COUNT(DISTINCT archive_path) as count FROM exchanges').get() as { count: number };
-
-    // Check for summaries (these are files, not DB fields)
-    const fs = await import('fs');
-    const conversationPaths = db.prepare('SELECT DISTINCT archive_path FROM exchanges').all() as Array<{ archive_path: string }>;
-    let withSummariesCount = 0;
-    for (const { archive_path } of conversationPaths) {
-      const summaryPath = archive_path.replace('.jsonl', '-summary.txt');
-      if (fs.existsSync(summaryPath)) {
-        withSummariesCount++;
-      }
-    }
-
-    // Total exchanges
-    const totalExchanges = db.prepare('SELECT COUNT(*) as count FROM exchanges').get() as { count: number };
-
-    // Date range
-    const dateRange = db.prepare('SELECT MIN(timestamp) as earliest, MAX(timestamp) as latest FROM exchanges').get() as { earliest: string; latest: string } | undefined;
-
-    // Project counts
-    const projectCount = db.prepare('SELECT COUNT(DISTINCT project) as count FROM exchanges').get() as { count: number };
-
-    // Top 10 projects
-    const topProjects = db.prepare(`
-      SELECT project, COUNT(DISTINCT archive_path) as count
-      FROM exchanges
-      GROUP BY project
-      ORDER BY count DESC
-      LIMIT 10
-    `).all() as Array<{ project: string; count: number }>;
-
-    return {
-      totalConversations: totalConversations.count,
-      conversationsWithSummaries: withSummariesCount,
-      conversationsWithoutSummaries: totalConversations.count - withSummariesCount,
-      totalExchanges: totalExchanges.count,
-      dateRange: dateRange?.earliest ? {
-        earliest: dateRange.earliest,
-        latest: dateRange.latest,
-      } : undefined,
-      projectCount: projectCount.count,
-      topProjects,
-    };
-  } finally {
-    db.close();
-  }
 }
 
 export function formatStats(stats: IndexStats): string {
   let output = 'Episodic Memory Index Statistics\n';
   output += '='.repeat(50) + '\n\n';
+
+  if (stats.databaseProvider) {
+    output += `Database Provider: ${stats.databaseProvider}\n\n`;
+  }
 
   output += `Total Conversations: ${stats.totalConversations.toLocaleString()}\n`;
   output += `Total Exchanges: ${stats.totalExchanges.toLocaleString()}\n\n`;
@@ -107,7 +85,7 @@ export function formatStats(stats: IndexStats): string {
   output += `With Summaries: ${stats.conversationsWithSummaries.toLocaleString()}\n`;
   output += `Without Summaries: ${stats.conversationsWithoutSummaries.toLocaleString()}\n`;
 
-  if (stats.conversationsWithoutSummaries > 0) {
+  if (stats.conversationsWithoutSummaries > 0 && stats.totalConversations > 0) {
     const percentage = ((stats.conversationsWithoutSummaries / stats.totalConversations) * 100).toFixed(1);
     output += `  (${percentage}% missing summaries)\n`;
   }

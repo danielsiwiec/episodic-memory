@@ -2,8 +2,8 @@
   "name": "episodic-memory-dev",
   "description": "Development marketplace for episodic memory plugin",
   "owner": {
-    "name": "Jesse Vincent",
-    "email": "jesse@fsck.com"
+    "name": "Dan Siwiec",
+    "email": "daniel.siwiec@gmail.com"
   },
   "plugins": [
     {
@@ -12,8 +12,8 @@
       "version": "1.0.15",
       "source": "./",
       "author": {
-        "name": "Jesse Vincent",
-        "email": "jesse@fsck.com"
+        "name": "Dan Siwiec",
+        "email": "daniel.siwiec@gmail.com"
       }
     }
   ]
