@@ -3,6 +3,49 @@ import path from 'path';
 import fs from 'fs';
 import * as sqliteVec from 'sqlite-vec';
 import { getDbPath } from './paths.js';
+import { getDatabaseConfig, getConfigDescription } from './config.js';
+import { SqliteProvider } from './providers/sqlite-provider.js';
+import { PostgresProvider } from './providers/postgres-provider.js';
+// Singleton provider instance
+let providerInstance = null;
+/**
+ * Get or create the database provider based on configuration.
+ * This is the main entry point for database operations.
+ */
+export async function getProvider() {
+    if (providerInstance) {
+        return providerInstance;
+    }
+    const config = getDatabaseConfig();
+    console.log(`Database: ${getConfigDescription()}`);
+    if (config.provider === 'postgresql') {
+        providerInstance = new PostgresProvider(config.postgresql);
+    }
+    else {
+        providerInstance = new SqliteProvider(config.sqlite);
+    }
+    await providerInstance.initialize();
+    return providerInstance;
+}
+/**
+ * Close the database provider connection
+ */
+export async function closeProvider() {
+    if (providerInstance) {
+        await providerInstance.close();
+        providerInstance = null;
+    }
+}
+/**
+ * Reset the provider instance (for testing)
+ */
+export function resetProvider() {
+    providerInstance = null;
+}
+// ============================================================================
+// Legacy SQLite-specific functions (for backward compatibility)
+// These will be deprecated in favor of the provider interface
+// ============================================================================
 export function migrateSchema(db) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info('exchanges')`).all();
     const columnNames = new Set(columns.map(c => c.name));
@@ -30,6 +73,9 @@ export function migrateSchema(db) {
         console.log('Migration complete.');
     }
 }
+/**
+ * @deprecated Use getProvider() instead
+ */
 export function initDatabase() {
     const dbPath = getDbPath();
     // Ensure directory exists
@@ -112,6 +158,9 @@ export function initDatabase() {
   `);
     return db;
 }
+/**
+ * @deprecated Use provider.insertExchange() instead
+ */
 export function insertExchange(db, exchange, embedding, toolNames) {
     const now = Date.now();
     const stmt = db.prepare(`
@@ -142,10 +191,16 @@ export function insertExchange(db, exchange, embedding, toolNames) {
         }
     }
 }
+/**
+ * @deprecated Use provider.getAllExchanges() instead
+ */
 export function getAllExchanges(db) {
     const stmt = db.prepare(`SELECT id, archive_path as archivePath FROM exchanges`);
     return stmt.all();
 }
+/**
+ * @deprecated Use provider.getFileLastIndexed() instead
+ */
 export function getFileLastIndexed(db, archivePath) {
     const stmt = db.prepare(`
     SELECT MAX(last_indexed) as lastIndexed
@@ -155,6 +210,9 @@ export function getFileLastIndexed(db, archivePath) {
     const row = stmt.get(archivePath);
     return row.lastIndexed;
 }
+/**
+ * @deprecated Use provider.deleteExchange() instead
+ */
 export function deleteExchange(db, id) {
     // Delete from vector table
     db.prepare(`DELETE FROM vec_exchanges WHERE id = ?`).run(id);

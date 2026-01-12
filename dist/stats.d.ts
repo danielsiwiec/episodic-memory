@@ -13,6 +13,7 @@ export interface IndexStats {
         count: number;
     }>;
     databaseSize?: string;
+    databaseProvider?: string;
 }
 export declare function getIndexStats(dbPath?: string): Promise<IndexStats>;
 export declare function formatStats(stats: IndexStats): string;

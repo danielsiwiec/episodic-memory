@@ -59,6 +59,10 @@ COMMANDS:
 OPTIONS:
   --concurrency N    Parallel summarization (1-16, default: 1)
   -c N               Short form of --concurrency
+  --days N           Only index conversations modified in the last N days
+  -d N               Short form of --days
+  --limit N          Stop after indexing N conversations
+  -l N               Short form of --limit
   --no-summaries     Skip AI summary generation (free, but no summaries in results)
   --help, -h         Show this help
 
@@ -71,6 +75,15 @@ EXAMPLES:
 
   # Index without AI summaries (free, fast)
   index-conversations --cleanup --no-summaries
+
+  # Index only conversations from the last 7 days
+  index-conversations -d 7
+
+  # Index only the first 100 conversations
+  index-conversations --limit 100
+
+  # Combine flags: last 30 days, max 50 conversations, 4 parallel
+  index-conversations -d 30 -l 50 -c 4
 
   # Check index health
   index-conversations --verify
